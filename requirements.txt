@@ -1,0 +1,7 @@
+Requests
+apscheduler
+pyyaml
+mypy
+types-PyYAML
+types-requests
+loguru
