@@ -130,13 +130,20 @@ class TestIlmComprehensive(unittest.TestCase):
 
     def test_should_manage_index(self):
         """Test index management filtering"""
+        # Mock _is_write_index to return False for regular indices
+        self.ilm._is_write_index = Mock(return_value=False)
+
         # Should manage log indices
         self.assertTrue(self.ilm._should_manage_index("log-suricata-tls-000001"))
         self.assertTrue(self.ilm._should_manage_index("alert-ids-000002"))
-        
-        # Should not manage write aliases
+
+        # Should not manage write aliases (now using robust write index detection)
+        self.ilm._is_write_index = Mock(return_value=True)
         self.assertFalse(self.ilm._should_manage_index("log-suricata-tls-write"))
-        
+
+        # Reset for non-write index tests
+        self.ilm._is_write_index = Mock(return_value=False)
+
         # Should not manage system indices
         self.assertFalse(self.ilm._should_manage_index(".kibana-1"))
         self.assertFalse(self.ilm._should_manage_index("random-index"))
@@ -835,47 +842,6 @@ class TestIlmComprehensive(unittest.TestCase):
             json={"conditions": {"max_size": "50gb", "max_age": "30d"}}
         )
 
-    def test_add_write_alias(self):
-        """Test adding write alias"""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        self.mock_requests.post.return_value = mock_response
-        
-        result = self.ilm._add_write_alias("log-test-000001", "log-test-write")
-        self.assertTrue(result)
-        
-        # Verify correct API call
-        args, kwargs = self.mock_requests.post.call_args
-        self.assertIn("_aliases", args[0])
-        expected_body = {
-            "actions": [{
-                "add": {
-                    "index": "log-test-000001",
-                    "alias": "log-test-write",
-                    "is_write_index": True
-                }
-            }]
-        }
-        self.assertEqual(kwargs['json'], expected_body)
-
-    def test_create_index_with_alias(self):
-        """Test creating index with write alias"""
-        mock_response = Mock()
-        mock_response.status_code = 201
-        self.mock_requests.put.return_value = mock_response
-        
-        result = self.ilm._create_index_with_alias("log-test-000001", "log-test-write")
-        self.assertTrue(result)
-        
-        # Verify correct API call
-        args, kwargs = self.mock_requests.put.call_args
-        self.assertIn("log-test-000001", args[0])
-        expected_body = {
-            "aliases": {
-                "log-test-write": {"is_write_index": True}
-            }
-        }
-        self.assertEqual(kwargs['json'], expected_body)
 
     def test_check_and_rollover_by_size(self):
         """Test rollover check delegated to OpenSearch"""
@@ -1206,29 +1172,41 @@ class TestIlmComprehensive(unittest.TestCase):
         settings.url = "https://test"
         
         custom_ilm = Ilm(settings)
-        
+
+        # Mock _is_write_index to return False for regular indices
+        custom_ilm._is_write_index = Mock(return_value=False)
+
         # Test indices that should be managed
         self.assertTrue(custom_ilm._should_manage_index("data-000001"))
         self.assertTrue(custom_ilm._should_manage_index("metrics-host-000001"))
         self.assertTrue(custom_ilm._should_manage_index("traces-jaeger-000001"))
-        
+
         # Test indices that should NOT be managed
         self.assertFalse(custom_ilm._should_manage_index("log-000001"))  # Not in custom patterns
         self.assertFalse(custom_ilm._should_manage_index("alert-000001"))  # Not in custom patterns
-        self.assertFalse(custom_ilm._should_manage_index("data-write"))  # Write alias
         self.assertFalse(custom_ilm._should_manage_index("system-000001"))  # Not in patterns
+
+        # Test write aliases (now using robust write index detection)
+        custom_ilm._is_write_index = Mock(return_value=True)
+        self.assertFalse(custom_ilm._should_manage_index("data-write"))  # Write alias
 
     def test_should_manage_index_with_default_patterns(self):
         """Test _should_manage_index with default patterns (log, alert)"""
+        # Mock _is_write_index to return False for regular indices
+        self.ilm._is_write_index = Mock(return_value=False)
+
         # Test indices that should be managed with default patterns
         self.assertTrue(self.ilm._should_manage_index("log-000001"))
         self.assertTrue(self.ilm._should_manage_index("alert-000001"))
         self.assertTrue(self.ilm._should_manage_index("log-system-2024.01.15"))
-        
+
         # Test indices that should NOT be managed
         self.assertFalse(self.ilm._should_manage_index("data-000001"))  # Not in default patterns
-        self.assertFalse(self.ilm._should_manage_index("log-write"))  # Write alias
         self.assertFalse(self.ilm._should_manage_index(".kibana"))  # System index
+
+        # Test write aliases (now using robust write index detection)
+        self.ilm._is_write_index = Mock(return_value=True)
+        self.assertFalse(self.ilm._should_manage_index("log-write"))  # Write alias
 
     def test_create_snapshot_with_validation_success(self):
         """Test snapshot creation with validation - success case"""

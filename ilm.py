@@ -43,23 +43,24 @@ class Ilm:
     def cleanup_old_data(self) -> None:
         """Delete indices and snapshots past retention period using three-phase approach"""
         logger.info(f"Cleaning up data older than {self.total_retention_days} days")
-        
+
         # Phase 1: Delete searchable snapshot indices older than retention
-        logger.info("Phase 1: Checking searchable snapshot indices...")
+        logger.info("Phase 1: Deleting expired searchable snapshot indices (mounted snapshots)...")
         indices = self.get_indices()
+        snapshots = self.get_snapshots()  # Fetch once for all searchable snapshots
         for index_info in indices:
             index_name = index_info['index']
             if index_name.endswith('-snapshot'):
                 # Extract base index name to check if it should be managed
                 base_index_name = index_name.replace('-snapshot', '')
                 if self._should_manage_index(base_index_name):
-                    age_days = self._get_searchable_snapshot_age_days(index_name)
+                    age_days = self._get_searchable_snapshot_age_days(index_name, snapshots)
                     if age_days >= self.total_retention_days:
                         logger.info(f"Deleting old searchable snapshot index {index_name} ({age_days:.1f} days old)")
                         self._delete_index(index_name)
 
         # Phase 2: Delete regular managed indices older than retention, then their corresponding snapshots
-        logger.info("Phase 2: Checking regular indices...")
+        logger.info("Phase 2: Deleting expired regular indices and their backing snapshots...")
         for index_info in indices:
             index_name = index_info['index']
             if not self._should_manage_index(index_name):
@@ -79,7 +80,7 @@ class Ilm:
                     self._delete_snapshot(corresponding_snapshot)
 
         # Phase 3: For each old snapshot, unmount any searchable snapshot indices referencing it, then delete snapshot
-        logger.info("Phase 3: Checking snapshots...")
+        logger.info("Phase 3: Cleaning up orphaned snapshots and their mounted indices...")
         snapshots = self.get_snapshots()
         for snapshot in snapshots:
             snapshot_age = self._snapshot_age_days(snapshot)
@@ -584,20 +585,6 @@ class Ilm:
             logger.error(f"Error getting write index for {alias_name}: {e}")
             return None
 
-    def _add_write_alias(self, index_name: str, alias_name: str) -> bool:
-        """Add write alias to index"""
-        body = {
-            "actions": [{
-                "add": {
-                    "index": index_name,
-                    "alias": alias_name,
-                    "is_write_index": True
-                }
-            }]
-        }
-        
-        response = self.requests.post(f"{self.base_url}/_aliases", json=body)
-        return response.status_code == 200
 
     # === PRIVATE INDEX OPERATIONS ===
     
@@ -633,23 +620,20 @@ class Ilm:
         # Now delete the snapshot
         self._delete_snapshot(snapshot_name)
 
-    def _create_index_with_alias(self, index_name: str, alias_name: str) -> bool:
-        """Create new index with write alias"""
-        body = {
-            "aliases": {
-                alias_name: {"is_write_index": True}
-            }
-        }
-        response = self.requests.put(f"{self.base_url}/{index_name}", json=body)
-        return response.status_code in [200, 201]
 
     # === PRIVATE QUERY/VALIDATION METHODS ===
 
     def _should_manage_index(self, index_name: str) -> bool:
         """Check if we should manage this index"""
-        if index_name.endswith("-write"):
+        # First check if it matches our managed patterns
+        if not index_name.startswith(self.managed_index_patterns):
             return False
-        return index_name.startswith(self.managed_index_patterns)
+
+        # Exclude write indices using robust API check
+        if self._is_write_index(index_name):
+            return False
+
+        return True
     
     def _is_ready_for_snapshot(self, index_name: str) -> bool:
         """Check if index is ready to be moved to snapshot"""
@@ -736,7 +720,7 @@ class Ilm:
         return (time.time() - end_epoch) / 86400.0
 
     def _get_index_age_days(self, index_name: str) -> float:
-        """Get index age in days"""
+        """Get index age in days with defensive handling of future timestamps"""
         try:
             response = self.requests.get(f"{self.base_url}/{index_name}/_settings")
             if response.status_code != 200:
@@ -745,30 +729,41 @@ class Ilm:
             settings = response.json()
             created_ms = int(settings[index_name]["settings"]["index"]["creation_date"])
             age_seconds = time.time() - (created_ms / 1000)
-            return age_seconds / 86400
+
+            # Defensive handling for future timestamps
+            if age_seconds < 0:
+                logger.warning(f"Index {index_name} has future creation timestamp ({created_ms}), treating as 0 age")
+                return 0
+
+            age_days = age_seconds / 86400
+            logger.debug(f"Index {index_name} age: {age_days:.1f} days (created: {created_ms})")
+            return age_days
         except Exception as e:
             logger.debug(f"Error calculating age for {index_name}: {e}")
             return 0
 
-    def _get_searchable_snapshot_age_days(self, searchable_index_name: str) -> float:
+    def _get_searchable_snapshot_age_days(self, searchable_index_name: str, snapshots: List[Dict[str, Any]] = None) -> float:
         """Get age of searchable snapshot index based on underlying snapshot timestamp"""
         try:
             # Extract snapshot name from searchable index name
             snapshot_name = searchable_index_name.replace('-snapshot', '')
-            
+
+            # Use provided snapshots list or fetch if not provided (for backward compatibility)
+            snapshots_list = snapshots if snapshots is not None else self.get_snapshots()
+
             # Find the snapshot in our snapshot list
-            for snapshot in self.get_snapshots():
+            for snapshot in snapshots_list:
                 if snapshot['id'] == snapshot_name:
                     snapshot_age = self._snapshot_age_days(snapshot)
                     if snapshot_age >= 0:
                         logger.debug(f"Searchable index {searchable_index_name} age based on snapshot: {snapshot_age:.1f} days")
                         return snapshot_age
                     break
-            
+
             # Fallback to index creation date if snapshot not found or has invalid age
             logger.debug(f"Could not determine snapshot age for {searchable_index_name}, falling back to index age")
             return self._get_index_age_days(searchable_index_name)
-            
+
         except Exception as e:
             logger.debug(f"Error calculating snapshot-based age for {searchable_index_name}: {e}")
             # Fallback to index creation date

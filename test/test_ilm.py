@@ -1,5 +1,11 @@
 import unittest
+import sys
+import os
 from unittest.mock import Mock, patch, MagicMock
+
+# Add parent directory to path to import modules
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from ilm import Ilm
 from settings import Settings
 
